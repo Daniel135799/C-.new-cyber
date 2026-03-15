@@ -1,0 +1,1213 @@
+/*
+ * Cybersecurity Toolkit
+ * Author: Student Project
+ * Version: 2.0
+ * Description: Comprehensive educational toolkit covering scanning, encryption,
+ *              cracking, and attack detection. Use only on authorized systems.
+ */
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <cctype>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <iomanip>
+#include <cstring>
+#include <cstdlib>
+#include <ctime>
+#include <memory>
+#include <functional>
+#include <filesystem>
+#include <regex>
+#include <set>
+
+// POSIX / networking headers
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+
+// For packet sniffer (optional)
+#ifdef HAVE_PCAP
+#include <pcap.h>
+#endif
+
+// Platform detection
+#if defined(__linux__)
+    #define PLATFORM_LINUX
+#elif defined(__APPLE__) && defined(__MACH__)
+    #define PLATFORM_MAC
+#else
+    #define PLATFORM_UNKNOWN
+#endif
+
+using namespace std;
+
+// ----------------------------------------------------------------------
+// Utility Functions
+// ----------------------------------------------------------------------
+
+string trim(const string& str) {
+    size_t first = str.find_first_not_of(" \t\n\r");
+    if (first == string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\n\r");
+    return str.substr(first, last - first + 1);
+}
+
+vector<string> split(const string& s, char delim) {
+    vector<string> tokens;
+    stringstream ss(s);
+    string item;
+    while (getline(ss, item, delim))
+        tokens.push_back(item);
+    return tokens;
+}
+
+bool fileExists(const string& path) {
+    return filesystem::exists(path);
+}
+
+string execCommand(const string& cmd) {
+    array<char, 128> buffer;
+    string result;
+    unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+    if (!pipe) return "";
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
+        result += buffer.data();
+    return result;
+}
+
+// ----------------------------------------------------------------------
+// AES-256 Implementation (from small AES, public domain)
+// ----------------------------------------------------------------------
+
+class AES256 {
+private:
+    static const uint8_t sbox[256];
+    static const uint8_t rsbox[256];
+    static const uint8_t Rcon[11];
+
+    uint8_t RoundKey[240];
+    uint8_t Iv[16];
+
+    void KeyExpansion(const uint8_t* key) {
+        // Standard AES key expansion for 256-bit key
+        uint32_t *w = (uint32_t*)RoundKey;
+        for (int i = 0; i < 8; i++) w[i] = (key[4*i]<<24)|(key[4*i+1]<<16)|(key[4*i+2]<<8)|key[4*i+3];
+        for (int i = 8; i < 60; i++) {
+            uint32_t temp = w[i-1];
+            if (i % 8 == 0) {
+                temp = (temp<<8)|(temp>>24);
+                uint8_t a[4] = {uint8_t(temp>>24), uint8_t(temp>>16), uint8_t(temp>>8), uint8_t(temp)};
+                a[0] = sbox[a[0]] ^ Rcon[i/8];
+                a[1] = sbox[a[1]];
+                a[2] = sbox[a[2]];
+                a[3] = sbox[a[3]];
+                temp = (a[0]<<24)|(a[1]<<16)|(a[2]<<8)|a[3];
+            } else if (i % 8 == 4) {
+                uint8_t a[4] = {uint8_t(temp>>24), uint8_t(temp>>16), uint8_t(temp>>8), uint8_t(temp)};
+                a[0] = sbox[a[0]];
+                a[1] = sbox[a[1]];
+                a[2] = sbox[a[2]];
+                a[3] = sbox[a[3]];
+                temp = (a[0]<<24)|(a[1]<<16)|(a[2]<<8)|a[3];
+            }
+            w[i] = w[i-8] ^ temp;
+        }
+    }
+
+    void AddRoundKey(uint8_t state[16], int round) {
+        for (int i = 0; i < 16; i++)
+            state[i] ^= RoundKey[round*16 + i];
+    }
+
+    void SubBytes(uint8_t state[16]) {
+        for (int i = 0; i < 16; i++)
+            state[i] = sbox[state[i]];
+    }
+
+    void ShiftRows(uint8_t state[16]) {
+        uint8_t tmp[16];
+        tmp[0] = state[0]; tmp[1] = state[5]; tmp[2] = state[10]; tmp[3] = state[15];
+        tmp[4] = state[4]; tmp[5] = state[9]; tmp[6] = state[14]; tmp[7] = state[3];
+        tmp[8] = state[8]; tmp[9] = state[13]; tmp[10] = state[2]; tmp[11] = state[7];
+        tmp[12] = state[12]; tmp[13] = state[1]; tmp[14] = state[6]; tmp[15] = state[11];
+        memcpy(state, tmp, 16);
+    }
+
+    void MixColumns(uint8_t state[16]) {
+        for (int i = 0; i < 4; i++) {
+            uint8_t a0 = state[i*4];
+            uint8_t a1 = state[i*4+1];
+            uint8_t a2 = state[i*4+2];
+            uint8_t a3 = state[i*4+3];
+            state[i*4]   = (uint8_t)(gmul(a0,2) ^ gmul(a1,3) ^ a2 ^ a3);
+            state[i*4+1] = (uint8_t)(a0 ^ gmul(a1,2) ^ gmul(a2,3) ^ a3);
+            state[i*4+2] = (uint8_t)(a0 ^ a1 ^ gmul(a2,2) ^ gmul(a3,3));
+            state[i*4+3] = (uint8_t)(gmul(a0,3) ^ a1 ^ a2 ^ gmul(a3,2));
+        }
+    }
+
+    uint8_t gmul(uint8_t a, uint8_t b) {
+        uint8_t p = 0;
+        for (int i = 0; i < 8; i++) {
+            if (b & 1) p ^= a;
+            a = (a & 0x80) ? (a << 1) ^ 0x1b : a << 1;
+            b >>= 1;
+        }
+        return p;
+    }
+
+    void InvSubBytes(uint8_t state[16]) {
+        for (int i = 0; i < 16; i++)
+            state[i] = rsbox[state[i]];
+    }
+
+    void InvShiftRows(uint8_t state[16]) {
+        uint8_t tmp[16];
+        tmp[0] = state[0]; tmp[1] = state[13]; tmp[2] = state[10]; tmp[3] = state[7];
+        tmp[4] = state[4]; tmp[5] = state[1]; tmp[6] = state[14]; tmp[7] = state[11];
+        tmp[8] = state[8]; tmp[9] = state[5]; tmp[10] = state[2]; tmp[11] = state[15];
+        tmp[12] = state[12]; tmp[13] = state[9]; tmp[14] = state[6]; tmp[15] = state[3];
+        memcpy(state, tmp, 16);
+    }
+
+    void InvMixColumns(uint8_t state[16]) {
+        for (int i = 0; i < 4; i++) {
+            uint8_t a0 = state[i*4];
+            uint8_t a1 = state[i*4+1];
+            uint8_t a2 = state[i*4+2];
+            uint8_t a3 = state[i*4+3];
+            state[i*4]   = (uint8_t)(gmul(a0,14) ^ gmul(a1,11) ^ gmul(a2,13) ^ gmul(a3,9));
+            state[i*4+1] = (uint8_t)(gmul(a0,9) ^ gmul(a1,14) ^ gmul(a2,11) ^ gmul(a3,13));
+            state[i*4+2] = (uint8_t)(gmul(a0,13) ^ gmul(a1,9) ^ gmul(a2,14) ^ gmul(a3,11));
+            state[i*4+3] = (uint8_t)(gmul(a0,11) ^ gmul(a1,13) ^ gmul(a2,9) ^ gmul(a3,14));
+        }
+    }
+
+    void Cipher(uint8_t block[16]) {
+        AddRoundKey(block, 0);
+        for (int round = 1; round < 14; round++) {
+            SubBytes(block);
+            ShiftRows(block);
+            MixColumns(block);
+            AddRoundKey(block, round);
+        }
+        SubBytes(block);
+        ShiftRows(block);
+        AddRoundKey(block, 14);
+    }
+
+    void InvCipher(uint8_t block[16]) {
+        AddRoundKey(block, 14);
+        for (int round = 13; round > 0; round--) {
+            InvShiftRows(block);
+            InvSubBytes(block);
+            AddRoundKey(block, round);
+            InvMixColumns(block);
+        }
+        InvShiftRows(block);
+        InvSubBytes(block);
+        AddRoundKey(block, 0);
+    }
+
+    void XORWithIv(uint8_t* data, int len) {
+        for (int i = 0; i < len; i++)
+            data[i] ^= Iv[i % 16];
+    }
+
+public:
+    AES256(const uint8_t* key, const uint8_t* iv) {
+        KeyExpansion(key);
+        memcpy(Iv, iv, 16);
+    }
+
+    void EncryptCBC(uint8_t* input, uint8_t* output, size_t len) {
+        // len must be multiple of 16
+        for (size_t i = 0; i < len; i += 16) {
+            for (int j = 0; j < 16; j++)
+                input[i+j] ^= Iv[j];
+            Cipher(input + i);
+            memcpy(output + i, input + i, 16);
+            memcpy(Iv, output + i, 16);
+        }
+    }
+
+    void DecryptCBC(uint8_t* input, uint8_t* output, size_t len) {
+        uint8_t lastIv[16];
+        memcpy(lastIv, Iv, 16);
+        for (size_t i = 0; i < len; i += 16) {
+            memcpy(Iv, input + i, 16);
+            memcpy(output + i, input + i, 16);
+            InvCipher(output + i);
+            for (int j = 0; j < 16; j++)
+                output[i+j] ^= lastIv[j];
+            memcpy(lastIv, input + i, 16);
+        }
+        memcpy(Iv, lastIv, 16);
+    }
+};
+
+// AES S-box and Rcon tables (abbreviated for space, full version in actual code)
+const uint8_t AES256::sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+const uint8_t AES256::rsbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+const uint8_t AES256::Rcon[11] = {
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+};
+
+// ----------------------------------------------------------------------
+// SHA-256 Implementation (public domain)
+// ----------------------------------------------------------------------
+
+class SHA256 {
+private:
+    uint32_t h[8];
+    uint8_t buffer[64];
+    uint64_t bitlen;
+    uint32_t datalen;
+
+    static const uint32_t k[64];
+
+    void transform() {
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = (buffer[i*4]<<24)|(buffer[i*4+1]<<16)|(buffer[i*4+2]<<8)|buffer[i*4+3];
+        for (int i = 16; i < 64; i++)
+            w[i] = sigma1(w[i-2]) + w[i-7] + sigma0(w[i-15]) + w[i-16];
+
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+        uint32_t e = h[4], f = h[5], g = h[6], _h = h[7];
+
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = _h + Sigma1(e) + ch(e,f,g) + k[i] + w[i];
+            uint32_t t2 = Sigma0(a) + maj(a,b,c);
+            _h = g;
+            g = f;
+            f = e;
+            e = d + t1;
+            d = c;
+            c = b;
+            b = a;
+            a = t1 + t2;
+        }
+
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += _h;
+    }
+
+    static inline uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32-n)); }
+    static inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
+    static inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
+    static inline uint32_t Sigma0(uint32_t x) { return rotr(x,2) ^ rotr(x,13) ^ rotr(x,22); }
+    static inline uint32_t Sigma1(uint32_t x) { return rotr(x,6) ^ rotr(x,11) ^ rotr(x,25); }
+    static inline uint32_t sigma0(uint32_t x) { return rotr(x,7) ^ rotr(x,18) ^ (x>>3); }
+    static inline uint32_t sigma1(uint32_t x) { return rotr(x,17) ^ rotr(x,19) ^ (x>>10); }
+
+public:
+    SHA256() {
+        h[0] = 0x6a09e667;
+        h[1] = 0xbb67ae85;
+        h[2] = 0x3c6ef372;
+        h[3] = 0xa54ff53a;
+        h[4] = 0x510e527f;
+        h[5] = 0x9b05688c;
+        h[6] = 0x1f83d9ab;
+        h[7] = 0x5be0cd19;
+        bitlen = 0;
+        datalen = 0;
+    }
+
+    void update(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i < len; i++) {
+            buffer[datalen++] = data[i];
+            if (datalen == 64) {
+                transform();
+                bitlen += 512;
+                datalen = 0;
+            }
+        }
+    }
+
+    void final(uint8_t* hash) {
+        size_t i = datalen;
+        if (datalen < 56) {
+            buffer[i++] = 0x80;
+            while (i < 56)
+                buffer[i++] = 0x00;
+        } else {
+            buffer[i++] = 0x80;
+            while (i < 64)
+                buffer[i++] = 0x00;
+            transform();
+            memset(buffer, 0, 56);
+        }
+
+        bitlen += datalen * 8;
+        for (i = 0; i < 8; i++)
+            buffer[56 + i] = (bitlen >> (56 - i*8)) & 0xff;
+        transform();
+
+        for (i = 0; i < 4; i++)
+            for (int j = 0; j < 8; j++)
+                hash[i + j*4] = (h[j] >> (24 - i*8)) & 0xff;
+    }
+};
+
+const uint32_t SHA256::k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+// ----------------------------------------------------------------------
+// Password Generator
+// ----------------------------------------------------------------------
+
+string generatePassword(int length = 16, bool useUpper = true, bool useLower = true,
+                        bool useDigits = true, bool useSpecial = true) {
+    string chars = "";
+    if (useUpper) chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    if (useLower) chars += "abcdefghijklmnopqrstuvwxyz";
+    if (useDigits) chars += "0123456789";
+    if (useSpecial) chars += "!@#$%^&*()_+-=[]{}|;:,.<>?";
+
+    if (chars.empty()) chars = "abcdefghijklmnopqrstuvwxyz";
+
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> dis(0, chars.size() - 1);
+
+    string password;
+    for (int i = 0; i < length; ++i)
+        password += chars[dis(gen)];
+    return password;
+}
+
+// ----------------------------------------------------------------------
+// Password Strength Analyzer
+// ----------------------------------------------------------------------
+
+string analyzePassword(const string& pwd) {
+    int score = 0;
+    if (pwd.length() >= 8) score++;
+    if (pwd.length() >= 12) score++;
+    bool hasUpper = false, hasLower = false, hasDigit = false, hasSpecial = false;
+    for (char c : pwd) {
+        if (isupper(c)) hasUpper = true;
+        else if (islower(c)) hasLower = true;
+        else if (isdigit(c)) hasDigit = true;
+        else hasSpecial = true;
+    }
+    if (hasUpper) score++;
+    if (hasLower) score++;
+    if (hasDigit) score++;
+    if (hasSpecial) score++;
+
+    string strength;
+    if (score <= 2) strength = "Weak";
+    else if (score <= 4) strength = "Moderate";
+    else if (score <= 6) strength = "Strong";
+    else strength = "Very Strong";
+
+    return strength + " (Score: " + to_string(score) + "/7)";
+}
+
+// ----------------------------------------------------------------------
+// File Encryption/Decryption (AES-256)
+// ----------------------------------------------------------------------
+
+void encryptFile(const string& inputFile, const string& outputFile, const string& password) {
+    // Derive key from password (simple PBKDF2 would be better, but for demo use SHA256)
+    uint8_t key[32], iv[16];
+    SHA256 sha;
+    sha.update(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+    sha.final(key);
+    // Use a fixed IV for demo (should be random in production)
+    memset(iv, 0, 16);
+
+    ifstream in(inputFile, ios::binary);
+    if (!in) { cerr << "Cannot open input file.\n"; return; }
+    ofstream out(outputFile, ios::binary);
+    if (!out) { cerr << "Cannot create output file.\n"; return; }
+
+    // Read file, pad to multiple of 16
+    in.seekg(0, ios::end);
+    size_t size = in.tellg();
+    in.seekg(0);
+    size_t paddedSize = ((size + 15) / 16) * 16;
+    vector<uint8_t> data(paddedSize, 0);
+    in.read(reinterpret_cast<char*>(data.data()), size);
+    // PKCS#7 padding
+    uint8_t padVal = paddedSize - size;
+    for (size_t i = size; i < paddedSize; i++)
+        data[i] = padVal;
+
+    AES256 aes(key, iv);
+    vector<uint8_t> encrypted(paddedSize);
+    aes.EncryptCBC(data.data(), encrypted.data(), paddedSize);
+
+    out.write(reinterpret_cast<char*>(encrypted.data()), paddedSize);
+    cout << "File encrypted successfully.\n";
+}
+
+void decryptFile(const string& inputFile, const string& outputFile, const string& password) {
+    uint8_t key[32], iv[16];
+    SHA256 sha;
+    sha.update(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+    sha.final(key);
+    memset(iv, 0, 16);
+
+    ifstream in(inputFile, ios::binary);
+    if (!in) { cerr << "Cannot open input file.\n"; return; }
+    ofstream out(outputFile, ios::binary);
+    if (!out) { cerr << "Cannot create output file.\n"; return; }
+
+    in.seekg(0, ios::end);
+    size_t size = in.tellg();
+    in.seekg(0);
+    if (size % 16 != 0) { cerr << "Invalid encrypted file (size not multiple of 16).\n"; return; }
+
+    vector<uint8_t> data(size);
+    in.read(reinterpret_cast<char*>(data.data()), size);
+
+    AES256 aes(key, iv);
+    vector<uint8_t> decrypted(size);
+    aes.DecryptCBC(data.data(), decrypted.data(), size);
+
+    // Remove PKCS#7 padding
+    uint8_t padVal = decrypted[size-1];
+    if (padVal > 16) { cerr << "Invalid padding.\n"; return; }
+    size_t originalSize = size - padVal;
+    out.write(reinterpret_cast<char*>(decrypted.data()), originalSize);
+    cout << "File decrypted successfully.\n";
+}
+
+// ----------------------------------------------------------------------
+// Hash Checker (SHA-256 of file)
+// ----------------------------------------------------------------------
+
+string sha256File(const string& filename) {
+    ifstream file(filename, ios::binary);
+    if (!file) return "";
+
+    SHA256 sha;
+    char buffer[4096];
+    while (file.read(buffer, sizeof(buffer))) {
+        sha.update(reinterpret_cast<uint8_t*>(buffer), file.gcount());
+    }
+    sha.update(reinterpret_cast<uint8_t*>(buffer), file.gcount());
+
+    uint8_t hash[32];
+    sha.final(hash);
+
+    stringstream ss;
+    for (int i = 0; i < 32; i++)
+        ss << hex << setw(2) << setfill('0') << (int)hash[i];
+    return ss.str();
+}
+
+// ----------------------------------------------------------------------
+// Secure Vault (AES-256 encrypted key-value store)
+// ----------------------------------------------------------------------
+
+class SecureVault {
+private:
+    string filename;
+    string password;
+    map<string, string> entries;
+
+    bool load() {
+        if (!fileExists(filename)) return true; // new vault
+
+        ifstream in(filename, ios::binary);
+        if (!in) return false;
+
+        // Read IV and encrypted data
+        uint8_t iv[16];
+        in.read(reinterpret_cast<char*>(iv), 16);
+        vector<uint8_t> encrypted;
+        char c;
+        while (in.get(c)) encrypted.push_back(c);
+
+        if (encrypted.empty()) return true;
+
+        // Derive key
+        uint8_t key[32];
+        SHA256 sha;
+        sha.update(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+        sha.final(key);
+
+        AES256 aes(key, iv);
+        vector<uint8_t> decrypted(encrypted.size());
+        aes.DecryptCBC(encrypted.data(), decrypted.data(), encrypted.size());
+
+        // Remove padding
+        uint8_t padVal = decrypted.back();
+        size_t dataSize = decrypted.size() - padVal;
+
+        string data(reinterpret_cast<char*>(decrypted.data()), dataSize);
+        stringstream ss(data);
+        string line;
+        while (getline(ss, line)) {
+            size_t pos = line.find('=');
+            if (pos != string::npos) {
+                string key = line.substr(0, pos);
+                string value = line.substr(pos + 1);
+                entries[key] = value;
+            }
+        }
+        return true;
+    }
+
+    bool save() {
+        stringstream plain;
+        for (const auto& [k, v] : entries)
+            plain << k << "=" << v << "\n";
+
+        string data = plain.str();
+        size_t paddedSize = ((data.size() + 15) / 16) * 16;
+        vector<uint8_t> padded(paddedSize, 0);
+        memcpy(padded.data(), data.data(), data.size());
+        uint8_t padVal = paddedSize - data.size();
+        for (size_t i = data.size(); i < paddedSize; i++)
+            padded[i] = padVal;
+
+        uint8_t iv[16];
+        random_device rd;
+        for (int i = 0; i < 16; i++) iv[i] = rd() % 256;
+
+        uint8_t key[32];
+        SHA256 sha;
+        sha.update(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+        sha.final(key);
+
+        AES256 aes(key, iv);
+        vector<uint8_t> encrypted(paddedSize);
+        aes.EncryptCBC(padded.data(), encrypted.data(), paddedSize);
+
+        ofstream out(filename, ios::binary);
+        if (!out) return false;
+        out.write(reinterpret_cast<char*>(iv), 16);
+        out.write(reinterpret_cast<char*>(encrypted.data()), encrypted.size());
+        return true;
+    }
+
+public:
+    SecureVault(const string& fname, const string& pwd) : filename(fname), password(pwd) {
+        load();
+    }
+
+    void set(const string& key, const string& value) {
+        entries[key] = value;
+        save();
+    }
+
+    string get(const string& key) {
+        auto it = entries.find(key);
+        if (it != entries.end()) return it->second;
+        return "";
+    }
+
+    void list() {
+        for (const auto& [k, v] : entries)
+            cout << k << " : " << v << endl;
+    }
+
+    bool remove(const string& key) {
+        auto it = entries.find(key);
+        if (it != entries.end()) {
+            entries.erase(it);
+            save();
+            return true;
+        }
+        return false;
+    }
+};
+
+// ----------------------------------------------------------------------
+// Port Scanner (multi-threaded TCP connect)
+// ----------------------------------------------------------------------
+
+class PortScanner {
+private:
+    string target;
+    int startPort, endPort;
+    int timeoutMs;
+    vector<int> openPorts;
+    mutex mtx;
+
+    bool scanPort(int port) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+
+        // Set non-blocking
+        fcntl(sock, F_SETFL, O_NONBLOCK);
+
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, target.c_str(), &addr.sin_addr);
+
+        connect(sock, (sockaddr*)&addr, sizeof(addr));
+        fd_set fdset;
+        FD_ZERO(&fdset);
+        FD_SET(sock, &fdset);
+        timeval tv;
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+        if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1) {
+            int so_error;
+            socklen_t len = sizeof(so_error);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+            if (so_error == 0) {
+                close(sock);
+                return true;
+            }
+        }
+        close(sock);
+        return false;
+    }
+
+public:
+    PortScanner(const string& ip, int start, int end, int timeout = 2000)
+        : target(ip), startPort(start), endPort(end), timeoutMs(timeout) {}
+
+    void scan() {
+        vector<thread> threads;
+        atomic<int> currentPort(startPort);
+
+        for (int i = 0; i < 100; ++i) { // 100 threads
+            threads.emplace_back([&]() {
+                while (true) {
+                    int port = currentPort.fetch_add(1);
+                    if (port > endPort) break;
+                    if (scanPort(port)) {
+                        lock_guard<mutex> lock(mtx);
+                        openPorts.push_back(port);
+                        cout << "Port " << port << " is open.\n";
+                    }
+                }
+            });
+        }
+
+        for (auto& t : threads)
+            t.join();
+    }
+
+    vector<int> getOpenPorts() { return openPorts; }
+};
+
+// ----------------------------------------------------------------------
+// Network Scanner (ICMP ping sweep)
+// ----------------------------------------------------------------------
+
+bool pingHost(const string& ip, int timeoutMs = 1000) {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        // Need root
+        return false;
+    }
+
+    struct icmphdr icmp;
+    icmp.type = ICMP_ECHO;
+    icmp.code = 0;
+    icmp.checksum = 0;
+    icmp.un.echo.id = getpid() & 0xFFFF;
+    icmp.un.echo.sequence = 1;
+
+    sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (sendto(sock, &icmp, sizeof(icmp), 0, (sockaddr*)&addr, sizeof(addr)) <= 0) {
+        close(sock);
+        return false;
+    }
+
+    char buffer[1024];
+    sockaddr_in sender;
+    socklen_t senderLen = sizeof(sender);
+    ssize_t len = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&sender, &senderLen);
+    close(sock);
+    return len > 0;
+}
+
+void networkScan(const string& subnet, int timeoutMs = 1000) {
+    // subnet like "192.168.1."
+    vector<thread> threads;
+    for (int i = 1; i < 255; ++i) {
+        string ip = subnet + to_string(i);
+        threads.emplace_back([ip, timeoutMs]() {
+            if (pingHost(ip, timeoutMs))
+                cout << "Host " << ip << " is alive.\n";
+        });
+    }
+    for (auto& t : threads) t.join();
+}
+
+// ----------------------------------------------------------------------
+// Packet Sniffer (requires libpcap)
+// ----------------------------------------------------------------------
+
+#ifdef HAVE_PCAP
+void packetHandler(u_char* user, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
+    cout << "Captured packet length: " << pkthdr->len << endl;
+    // Simple Ethernet/IP parser would go here
+}
+
+void startSniffer(const string& interface) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_live(interface.c_str(), BUFSIZ, 1, 1000, errbuf);
+    if (!handle) {
+        cerr << "pcap_open_live failed: " << errbuf << endl;
+        return;
+    }
+
+    struct bpf_program fp;
+    char filter_exp[] = "ip";  // Capture only IP packets
+    if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        cerr << "Couldn't parse filter " << filter_exp << ": " << pcap_geterr(handle) << endl;
+        pcap_close(handle);
+        return;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        cerr << "Couldn't install filter: " << pcap_geterr(handle) << endl;
+        pcap_close(handle);
+        return;
+    }
+
+    cout << "Sniffing on interface " << interface << ". Press Ctrl+C to stop.\n";
+    pcap_loop(handle, 0, packetHandler, nullptr);
+    pcap_close(handle);
+}
+#else
+void startSniffer(const string& interface) {
+    cout << "Packet sniffer not compiled with libpcap. Simulating...\n";
+    // Dummy: show a few fake packets
+    cout << "Simulated packet: 192.168.1.1 -> 192.168.1.100 TCP port 80\n";
+    cout << "Simulated packet: 192.168.1.100 -> 192.168.1.1 TCP port 54321\n";
+}
+#endif
+
+// ----------------------------------------------------------------------
+// Password Cracker (dictionary attack on MD5 hashes - simplified)
+// ----------------------------------------------------------------------
+
+string md5(const string& input) {
+    // Placeholder: real MD5 would be implemented; here we just return a hex of input for demo.
+    // In a real tool, use OpenSSL or a proper MD5.
+    // For demo, we'll simulate by returning a hash that matches if input is "password".
+    // This is just to show the concept.
+    static map<string,string> fake = {
+        {"5f4dcc3b5aa765d61d8327deb882cf99", "password"}, // MD5 of "password"
+        {"e10adc3949ba59abbe56e057f20f883e", "123456"},
+        {"25f9e794323b453885f5181f1b624d0b", "123456789"}
+    };
+    if (fake.count(input)) return fake[input];
+    return "";
+}
+
+void crackHash(const string& hash, const string& wordlistFile) {
+    ifstream wordlist(wordlistFile);
+    if (!wordlist) {
+        cerr << "Cannot open wordlist file.\n";
+        return;
+    }
+
+    string word;
+    int attempts = 0;
+    while (getline(wordlist, word)) {
+        word = trim(word);
+        if (word.empty()) continue;
+        // Compute hash of word (using fake MD5 for demo)
+        // In real code, compute actual hash and compare
+        // For demo, we use a precomputed map
+        if (md5(word) == hash) {
+            cout << "Password found: " << word << " after " << attempts << " attempts.\n";
+            return;
+        }
+        attempts++;
+        if (attempts % 1000 == 0)
+            cout << "Checked " << attempts << " words...\n";
+    }
+    cout << "Password not found in wordlist.\n";
+}
+
+// ----------------------------------------------------------------------
+// WiFi Scanner (platform-specific)
+// ----------------------------------------------------------------------
+
+void scanWiFi() {
+    cout << "\n--- WiFi Networks ---\n";
+#if defined(PLATFORM_LINUX)
+    string output = execCommand("iwlist wlan0 scan 2>/dev/null");
+    if (output.empty()) output = execCommand("iwlist wlp2s0 scan 2>/dev/null");
+    if (output.empty()) {
+        cout << "Could not run iwlist. Try as root or install wireless-tools.\n";
+        return;
+    }
+    vector<string> lines = split(output, '\n');
+    string ssid, bssid, channel, signal, encryption;
+    for (const string& line : lines) {
+        if (line.find("ESSID:") != string::npos) {
+            ssid = line.substr(line.find("ESSID:") + 7);
+            ssid = trim(ssid);
+            if (!ssid.empty() && ssid.front() == '"' && ssid.back() == '"')
+                ssid = ssid.substr(1, ssid.size()-2);
+        } else if (line.find("Address:") != string::npos) {
+            bssid = line.substr(line.find("Address:") + 8);
+            bssid = trim(bssid);
+        } else if (line.find("Channel:") != string::npos) {
+            channel = line.substr(line.find("Channel:") + 8);
+            channel = trim(channel);
+        } else if (line.find("Quality=") != string::npos) {
+            size_t qpos = line.find("Quality=");
+            signal = line.substr(qpos + 8);
+            signal = signal.substr(0, signal.find(' '));
+        } else if (line.find("Encryption key:") != string::npos) {
+            encryption = (line.find("on") != string::npos) ? "On" : "Off";
+        }
+        if (!ssid.empty() && !bssid.empty()) {
+            cout << "SSID: " << ssid << "\nBSSID: " << bssid
+                 << "\nChannel: " << channel << "\nSignal: " << signal
+                 << "\nEncryption: " << encryption << "\n\n";
+            ssid = bssid = channel = signal = encryption = "";
+        }
+    }
+#elif defined(PLATFORM_MAC)
+    string output = execCommand("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s");
+    if (output.empty()) {
+        cout << "airport command not found.\n";
+        return;
+    }
+    vector<string> lines = split(output, '\n');
+    for (size_t i = 1; i < lines.size(); i++) {
+        if (lines[i].empty()) continue;
+        // Parse: SSID BSSID(RSSI) CHANNEL HT CC SECURITY
+        // This is a rough parse
+        stringstream ss(lines[i]);
+        string ssid, bssid, rssi, channel, ht, cc, security;
+        ss >> ssid >> bssid >> rssi >> channel >> ht >> cc >> security;
+        cout << "SSID: " << ssid << "\nBSSID: " << bssid
+             << "\nChannel: " << channel << "\nSignal: " << rssi
+             << "\nEncryption: " << security << "\n\n";
+    }
+#else
+    cout << "WiFi scanning not supported on this platform. Simulating...\n";
+    // Dummy data
+    cout << "SSID: HomeNetwork\nBSSID: 00:11:22:33:44:55\nChannel: 6\nSignal: -45 dBm\nEncryption: WPA2\n\n";
+    cout << "SSID: CoffeeShop\nBSSID: 66:77:88:99:AA:BB\nChannel: 11\nSignal: -67 dBm\nEncryption: WPA2\n\n";
+#endif
+}
+
+// ----------------------------------------------------------------------
+// Bluetooth Scanner (platform-specific)
+// ----------------------------------------------------------------------
+
+void scanBluetooth() {
+    cout << "\n--- Bluetooth Devices ---\n";
+#if defined(PLATFORM_LINUX)
+    string output = execCommand("hcitool scan 2>/dev/null");
+    if (output.empty()) {
+        cout << "hcitool not available. Try installing bluez.\n";
+        return;
+    }
+    vector<string> lines = split(output, '\n');
+    for (size_t i = 1; i < lines.size(); i++) {
+        if (lines[i].size() > 18) {
+            string mac = lines[i].substr(0, 17);
+            string name = lines[i].substr(18);
+            cout << "Device: " << name << " (" << mac << ")\n";
+        }
+    }
+#elif defined(PLATFORM_MAC)
+    string output = execCommand("system_profiler SPBluetoothDataType");
+    // Parse for connected devices, but scanning is not trivial on macOS without private APIs
+    cout << "Bluetooth scanning on macOS requires additional permissions.\nSimulating...\n";
+    cout << "Device: iPhone (12:34:56:78:90:AB)\n";
+#else
+    cout << "Bluetooth scanning not supported on this platform. Simulating...\n";
+    cout << "Device: Unknown (11:22:33:44:55:66)\n";
+#endif
+}
+
+// ----------------------------------------------------------------------
+// Attack Detection Engine (simple simulation)
+// ----------------------------------------------------------------------
+
+void detectAttacks() {
+    cout << "\n--- Attack Detection Engine ---\n";
+    // Check for many open ports (possible scan)
+    system("netstat -an | grep -c LISTEN > /tmp/listen_count");
+    ifstream in("/tmp/listen_count");
+    int count = 0;
+    in >> count;
+    if (count > 20) cout << "[ALERT] High number of listening ports (" << count << "). Possible backdoor?\n";
+    else cout << "Listening ports count: " << count << " (normal)\n";
+
+    // Check for failed SSH logins
+    string log = execCommand("grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -5");
+    if (!log.empty()) {
+        cout << "[ALERT] Recent failed SSH logins:\n" << log << "\n";
+    }
+
+    // Simulate other checks
+    cout << "Attack detection engine running... (simulated)\n";
+}
+
+// ----------------------------------------------------------------------
+// Security Knowledge Base
+// ----------------------------------------------------------------------
+
+void showKnowledge() {
+    cout << "\n=== Security Knowledge Base ===\n";
+    cout << "1. Use strong passwords (12+ chars, mixed case, numbers, symbols).\n";
+    cout << "2. Enable 2FA wherever possible.\n";
+    cout << "3. Keep software updated to patch vulnerabilities.\n";
+    cout << "4. Avoid using public Wi-Fi without VPN.\n";
+    cout << "5. Regularly backup important data.\n";
+    cout << "6. Be cautious of phishing emails and links.\n";
+    cout << "7. Use a password manager.\n";
+    cout << "8. Encrypt sensitive files.\n";
+    cout << "9. Monitor network for unusual activity.\n";
+    cout << "10. Understand social engineering tactics.\n";
+}
+
+// ----------------------------------------------------------------------
+// Main Menu
+// ----------------------------------------------------------------------
+
+void printBanner() {
+    cout << R"(
+    ╔══════════════════════════════════════════════════════════╗
+    ║            CYBERSECURITY TOOLKIT v2.0                   ║
+    ║           Educational Use Only - Authorized              ║
+    ╚══════════════════════════════════════════════════════════╝
+    )" << endl;
+}
+
+int main() {
+    printBanner();
+
+    while (true) {
+        cout << "\nMain Menu:\n";
+        cout << " 1. WiFi Scanner\n";
+        cout << " 2. Bluetooth Scanner\n";
+        cout << " 3. Password Generator\n";
+        cout << " 4. File Encryption (AES-256)\n";
+        cout << " 5. File Decryption (AES-256)\n";
+        cout << " 6. Hash Checker (SHA-256)\n";
+        cout << " 7. Password Strength Analyzer\n";
+        cout << " 8. Secure Vault\n";
+        cout << " 9. Port Scanner\n";
+        cout << "10. Packet Sniffer\n";
+        cout << "11. Password Cracker (dictionary)\n";
+        cout << "12. Network Scanner (ping sweep)\n";
+        cout << "13. Attack Detection Engine\n";
+        cout << "14. Security Knowledge\n";
+        cout << "15. About / Help\n";
+        cout << " 0. Exit\n";
+        cout << "Choose an option: ";
+
+        int choice;
+        cin >> choice;
+        cin.ignore();
+
+        switch (choice) {
+            case 1:
+                scanWiFi();
+                break;
+            case 2:
+                scanBluetooth();
+                break;
+            case 3: {
+                int len;
+                cout << "Password length: ";
+                cin >> len;
+                cout << "Generated: " << generatePassword(len) << endl;
+                break;
+            }
+            case 4: {
+                string infile, outfile, pwd;
+                cout << "Input file: "; getline(cin, infile);
+                cout << "Output file: "; getline(cin, outfile);
+                cout << "Password: "; getline(cin, pwd);
+                encryptFile(infile, outfile, pwd);
+                break;
+            }
+            case 5: {
+                string infile, outfile, pwd;
+                cout << "Input file: "; getline(cin, infile);
+                cout << "Output file: "; getline(cin, outfile);
+                cout << "Password: "; getline(cin, pwd);
+                decryptFile(infile, outfile, pwd);
+                break;
+            }
+            case 6: {
+                string file;
+                cout << "File to hash: "; getline(cin, file);
+                string hash = sha256File(file);
+                if (hash.empty()) cout << "File not found.\n";
+                else cout << "SHA-256: " << hash << endl;
+                break;
+            }
+            case 7: {
+                string pwd;
+                cout << "Enter password: "; getline(cin, pwd);
+                cout << "Strength: " << analyzePassword(pwd) << endl;
+                break;
+            }
+            case 8: {
+                string vaultFile, password;
+                cout << "Vault file path: "; getline(cin, vaultFile);
+                cout << "Vault password: "; getline(cin, password);
+                SecureVault vault(vaultFile, password);
+                while (true) {
+                    cout << "\nVault Menu: (s)et, (g)et, (l)ist, (r)emove, (q)uit: ";
+                    char cmd;
+                    cin >> cmd; cin.ignore();
+                    if (cmd == 'q') break;
+                    if (cmd == 's') {
+                        string key, val;
+                        cout << "Key: "; getline(cin, key);
+                        cout << "Value: "; getline(cin, val);
+                        vault.set(key, val);
+                    } else if (cmd == 'g') {
+                        string key;
+                        cout << "Key: "; getline(cin, key);
+                        cout << "Value: " << vault.get(key) << endl;
+                    } else if (cmd == 'l') {
+                        vault.list();
+                    } else if (cmd == 'r') {
+                        string key;
+                        cout << "Key: "; getline(cin, key);
+                        if (vault.remove(key))
+                            cout << "Removed.\n";
+                        else
+                            cout << "Key not found.\n";
+                    }
+                }
+                break;
+            }
+            case 9: {
+                string ip;
+                int start, end;
+                cout << "Target IP: "; getline(cin, ip);
+                cout << "Start port: "; cin >> start;
+                cout << "End port: "; cin >> end;
+                PortScanner scanner(ip, start, end);
+                cout << "Scanning...\n";
+                scanner.scan();
+                auto ports = scanner.getOpenPorts();
+                if (ports.empty())
+                    cout << "No open ports found.\n";
+                else {
+                    cout << "Open ports: ";
+                    for (int p : ports) cout << p << " ";
+                    cout << endl;
+                }
+                break;
+            }
+            case 10: {
+                string iface;
+                cout << "Interface (e.g., eth0, en0): "; getline(cin, iface);
+                startSniffer(iface);
+                break;
+            }
+            case 11: {
+                string hash, wordlist;
+                cout << "Enter hash (MD5 for demo): "; getline(cin, hash);
+                cout << "Wordlist file: "; getline(cin, wordlist);
+                crackHash(hash, wordlist);
+                break;
+            }
+            case 12: {
+                string subnet;
+                cout << "Subnet (e.g., 192.168.1.): "; getline(cin, subnet);
+                cout << "Scanning...\n";
+                networkScan(subnet);
+                break;
+            }
+            case 13:
+                detectAttacks();
+                break;
+            case 14:
+                showKnowledge();
+                break;
+            case 15:
+                cout << "\nCybersecurity Toolkit v2.0\n";
+                cout << "Developed for educational projects.\n";
+                cout << "Features: WiFi/Bluetooth scan, encryption, vault, scanning, cracking, detection.\n";
+                cout << "WARNING: Use only on systems you own or have permission to test.\n";
+                break;
+            case 0:
+                cout << "Exiting. Stay secure!\n";
+                return 0;
+            default:
+                cout << "Invalid option.\n";
+        }
+    }
+
+    return 0;
+}
